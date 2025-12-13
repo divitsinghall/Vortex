@@ -55,3 +55,15 @@ minio_data/
 # Build artifacts
 dist/
 build/
+
+# Next.js / Frontend
+vortex-web/node_modules/
+vortex-web/.next/
+vortex-web/out/
+vortex-web/.turbo/
+vortex-web/.vercel/
+vortex-web/next-env.d.ts
+vortex-web/.eslintcache
+vortex-web/npm-debug.log*
+vortex-web/yarn-debug.log*
+vortex-web/yarn-error.log*
