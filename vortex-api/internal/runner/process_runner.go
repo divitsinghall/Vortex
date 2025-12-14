@@ -71,6 +71,7 @@ type ProcessRunner struct {
 	binaryPath     string
 	semaphore      chan struct{} // buffered channel acting as counting semaphore
 	defaultTimeout time.Duration
+	redisURL       string // Redis URL for real-time log streaming
 }
 
 // ProcessRunnerConfig holds configuration for the runner.
@@ -78,6 +79,7 @@ type ProcessRunnerConfig struct {
 	BinaryPath     string
 	MaxConcurrent  int           // size of the worker pool
 	DefaultTimeout time.Duration // max execution time per request
+	RedisURL       string        // Redis URL for real-time log streaming (optional)
 }
 
 // NewProcessRunner creates a new runner with the given configuration.
@@ -97,6 +99,7 @@ func NewProcessRunner(cfg ProcessRunnerConfig) *ProcessRunner {
 		binaryPath:     cfg.BinaryPath,
 		semaphore:      make(chan struct{}, cfg.MaxConcurrent),
 		defaultTimeout: cfg.DefaultTimeout,
+		redisURL:       cfg.RedisURL,
 	}
 }
 
@@ -188,7 +191,14 @@ func (r *ProcessRunner) Execute(ctx context.Context, functionID, code string) (*
 	// -----------------------------------------------------------------
 	// exec.CommandContext is KEY - it ensures the process is killed
 	// when the context is cancelled (either by timeout or parent cancellation).
-	cmd := exec.CommandContext(execCtx, r.binaryPath, tempFile)
+	//
+	// If Redis URL is configured, pass --redis-url and --function-id flags
+	// to enable real-time log streaming via Redis Pub/Sub.
+	args := []string{tempFile}
+	if r.redisURL != "" {
+		args = append(args, "--redis-url", r.redisURL, "--function-id", functionID)
+	}
+	cmd := exec.CommandContext(execCtx, r.binaryPath, args...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

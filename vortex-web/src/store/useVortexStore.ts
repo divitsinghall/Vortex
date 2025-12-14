@@ -30,6 +30,10 @@ interface VortexState {
     error: string | null;
     status: ExecutionStatus;
 
+    // Real-time streaming state
+    functionId: string | null;
+    setFunctionId: (id: string | null) => void;
+
     // Actions
     startExecution: () => void;
     setDeploying: () => void;
@@ -37,6 +41,9 @@ interface VortexState {
     setSuccess: (result: { logs: LogEntry[]; output: unknown; executionTime: number }) => void;
     setError: (error: string) => void;
     reset: () => void;
+
+    // Real-time log streaming
+    appendLog: (log: LogEntry) => void;
 }
 
 const DEFAULT_CODE = `// Welcome to Vortex! 🌀
@@ -67,6 +74,7 @@ export const useVortexStore = create<VortexState>((set) => ({
     executionTime: null,
     error: null,
     status: 'idle',
+    functionId: null,
 
     // Actions
     setCode: (code) => set({ code }),
@@ -77,19 +85,22 @@ export const useVortexStore = create<VortexState>((set) => ({
         output: null,
         executionTime: null,
         error: null,
+        functionId: null, // Reset function ID
     }),
 
     setDeploying: () => set({ status: 'deploying' }),
 
     setRunning: () => set({ status: 'running' }),
 
-    setSuccess: ({ logs, output, executionTime }) => set({
+    setSuccess: ({ logs, output, executionTime }) => set((state) => ({
         status: 'success',
-        logs,
+        // If empty logs array is passed, preserve the streamed logs
+        // Otherwise use the provided logs (for backwards compatibility)
+        logs: logs.length > 0 ? logs : state.logs,
         output,
         executionTime,
         error: null,
-    }),
+    })),
 
     setError: (error) => set({
         status: 'error',
@@ -102,5 +113,13 @@ export const useVortexStore = create<VortexState>((set) => ({
         executionTime: null,
         error: null,
         status: 'idle',
+        functionId: null,
     }),
+
+    // Real-time streaming actions
+    setFunctionId: (id) => set({ functionId: id }),
+
+    appendLog: (log) => set((state) => ({
+        logs: [...state.logs, log],
+    })),
 }));

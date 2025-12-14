@@ -1,7 +1,6 @@
 # Rust
 vortex-runtime/target/
 **/*.rs.bk
-Cargo.lock
 
 # Go
 vortex-api/vortex-api
@@ -51,10 +50,15 @@ logs/
 
 # Docker data volumes
 minio_data/
+vortex-api/minio_data/
 
 # Build artifacts
 dist/
 build/
+
+# MinIO binaries (downloaded for local dev)
+vortex-api/minio
+vortex-api/mc
 
 # Next.js / Frontend
 vortex-web/node_modules/
@@ -67,3 +71,4 @@ vortex-web/.eslintcache
 vortex-web/npm-debug.log*
 vortex-web/yarn-debug.log*
 vortex-web/yarn-error.log*
+

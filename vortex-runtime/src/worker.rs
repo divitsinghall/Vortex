@@ -6,6 +6,7 @@
 //! - Custom op registration for console capture and timing
 //! - Event loop execution for async/await support
 //! - Result collection with timing metrics
+//! - Real-time log streaming via Redis Pub/Sub (optional)
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,9 +16,10 @@ use anyhow::{anyhow, Result};
 use deno_core::{extension, v8, JsRuntime, RuntimeOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 use crate::bootstrap::BOOTSTRAP_JS;
-use crate::ops::{op_get_time_ms, op_log, LogEntry, LogStorage};
+use crate::ops::{op_get_time_ms, op_log, LogEntry, LogStorage, RedisPublisher, RedisPublisherState};
 
 /// Result of executing a JavaScript script in the Vortex runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,14 +44,17 @@ impl ExecutionResult {
 }
 
 // Define our extension that registers custom ops
+// Now includes both LogStorage and RedisPublisherState
 extension!(
     vortex_runtime,
     ops = [op_log, op_get_time_ms],
     options = {
         log_storage: LogStorage,
+        redis_pub: RedisPublisherState,
     },
     state = |state, options| {
         state.put::<LogStorage>(options.log_storage);
+        state.put::<RedisPublisherState>(options.redis_pub);
     }
 );
 
@@ -62,6 +67,7 @@ extension!(
 /// - **Log Capture**: Console output is intercepted and stored
 /// - **Async Support**: Full async/await via tokio event loop integration
 /// - **Metrics**: Execution timing for performance monitoring
+/// - **Real-time Streaming**: Optional Redis Pub/Sub for live log streaming
 ///
 /// # Example
 ///
@@ -94,14 +100,82 @@ impl VortexWorker {
     ///
     /// Returns an error if the bootstrap JavaScript fails to execute.
     pub fn new() -> Result<Self> {
+        Self::new_with_redis(None, None)
+    }
+
+    /// Create a new VortexWorker with optional Redis Pub/Sub support.
+    ///
+    /// When a Redis client and function ID are provided, logs will be
+    /// published in real-time to the Redis channel `logs:{function_id}`.
+    ///
+    /// # Arguments
+    ///
+    /// * `redis_client` - Optional Redis client for pub/sub
+    /// * `function_id` - Optional function ID for the Redis channel name
+    ///
+    /// # Architecture: Non-blocking Redis Publishing
+    ///
+    /// To avoid blocking the V8 event loop, we use a "fire-and-forget" pattern:
+    /// 1. op_log sends messages through an unbounded mpsc channel
+    /// 2. A background tokio task receives messages and publishes to Redis
+    /// 3. The op returns immediately without waiting for Redis confirmation
+    ///
+    /// This ensures JavaScript execution remains fast even if Redis is slow.
+    pub fn new_with_redis(
+        redis_client: Option<redis::Client>,
+        function_id: Option<String>,
+    ) -> Result<Self> {
         // Create shared log storage that ops can write to
         let log_storage: LogStorage = Rc::new(RefCell::new(Vec::new()));
+        
+        // Create Redis publisher state (initially None)
+        let redis_pub_state: RedisPublisherState = Rc::new(RefCell::new(None));
+
+        // If Redis client and function ID are provided, set up the publisher
+        if let (Some(client), Some(func_id)) = (redis_client, function_id) {
+            let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+            
+            // Store the sender in the state
+            redis_pub_state.borrow_mut().replace(RedisPublisher { sender: tx });
+            
+            // Spawn a background task to publish messages to Redis
+            // This runs independently of the V8 event loop
+            let channel = format!("logs:{}", func_id);
+            tokio::spawn(async move {
+                // Get async connection to Redis
+                match client.get_multiplexed_async_connection().await {
+                    Ok(mut conn) => {
+                        // Process messages from the channel
+                        while let Some(msg) = rx.recv().await {
+                            // Publish to Redis, ignoring errors (fire-and-forget)
+                            let publish_result: Result<(), redis::RedisError> = redis::cmd("PUBLISH")
+                                .arg(&channel)
+                                .arg(&msg)
+                                .query_async(&mut conn)
+                                .await;
+                            
+                            if let Err(e) = publish_result {
+                                eprintln!("Redis publish error (non-fatal): {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to connect to Redis (logs won't stream): {}", e);
+                        // Still drain the channel to avoid memory buildup
+                        while rx.recv().await.is_some() {}
+                    }
+                }
+            });
+        }
 
         // Build the runtime with our extension
         // Note: We intentionally don't add deno_fs, deno_net, etc.
         // to maintain a secure sandbox
         let runtime = JsRuntime::new(RuntimeOptions {
-            extensions: vec![vortex_runtime::init_ops(log_storage.clone())],
+            extensions: vec![vortex_runtime::init_ops(
+                log_storage.clone(),
+                redis_pub_state,
+            )],
             ..Default::default()
         });
 

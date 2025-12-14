@@ -3,6 +3,7 @@
 import { useCallback } from 'react';
 import axios, { AxiosError } from 'axios';
 import { useVortexStore, LogEntry } from '@/store/useVortexStore';
+import { useLogStream } from './useLogStream';
 
 /**
  * API response types matching the Go backend
@@ -25,22 +26,29 @@ interface ApiError {
 /**
  * Custom hook for running functions through the Vortex platform.
  * 
- * Implements the Two-Step Deploy→Execute flow:
+ * Implements the Two-Step Deploy→Execute flow with real-time log streaming:
  * 1. POST /api/deploy - Deploy the code, receive function_id
- * 2. POST /api/execute/{function_id} - Execute and get results
+ * 2. Connect WebSocket for real-time logs
+ * 3. POST /api/execute/{function_id} - Execute and get results
  * 
  * This abstraction makes the two API calls feel like a single "Run" action
- * to the user, providing seamless execution experience.
+ * to the user, providing seamless execution experience with real-time feedback.
  */
 export function useRunFunction() {
     const {
         code,
         status,
+        functionId,
         startExecution,
         setRunning,
+        setFunctionId,
         setSuccess,
         setError,
     } = useVortexStore();
+
+    // Real-time log streaming via WebSocket
+    // This hook connects to ws://localhost:8080/ws/{functionId} when status is 'running'
+    useLogStream(functionId);
 
     const isRunning = status === 'deploying' || status === 'running';
 
@@ -59,20 +67,29 @@ export function useRunFunction() {
 
             const { function_id } = deployResponse.data;
 
+            // Store the function ID for WebSocket connection
+            // This will trigger the useLogStream hook to connect
+            setFunctionId(function_id);
+
             // Update status to show we're now executing
+            // This also triggers the WebSocket connection in useLogStream
             setRunning();
 
             // Step 2: EXECUTE - Run the deployed function
-            // This invokes the Rust runtime to execute the JavaScript
+            // While this is running, logs are streamed in real-time via WebSocket
+            // The Rust runtime publishes to Redis, Go forwards to WebSocket
             const executeResponse = await axios.post<ExecuteResponse>(
                 `/api/execute/${function_id}`
             );
 
-            const { output, logs, execution_time_ms } = executeResponse.data;
+            const { output, execution_time_ms } = executeResponse.data;
 
             // Step 3: Update store with results
+            // Note: We preserve the real-time streamed logs instead of replacing
+            // with the final batch. The streamed logs should be identical,
+            // but we keep what we already have for better UX.
             setSuccess({
-                logs,
+                logs: [], // Keep existing streamed logs, don't overwrite
                 output,
                 executionTime: execution_time_ms,
             });
@@ -97,10 +114,11 @@ export function useRunFunction() {
 
             setError(errorMessage);
         }
-    }, [code, isRunning, startExecution, setRunning, setSuccess, setError]);
+    }, [code, isRunning, startExecution, setRunning, setFunctionId, setSuccess, setError]);
 
     return {
         run,
         isRunning,
     };
 }
+

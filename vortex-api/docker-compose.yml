@@ -3,8 +3,8 @@ services:
     image: minio/minio:latest
     container_name: vortex-minio
     ports:
-      - "9000:9000"   # API
-      - "9001:9001"   # Console
+      - "9000:9000" # API
+      - "9001:9001" # Console
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -12,7 +12,7 @@ services:
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: [ "CMD", "mc", "ready", "local" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -24,14 +24,19 @@ services:
       minio:
         condition: service_started
     entrypoint: >
-      /bin/sh -c "
-      sleep 3;
-      mc alias set vortex http://minio:9000 minioadmin minioadmin;
-      mc mb vortex/vortex-functions --ignore-existing;
-      mc anonymous set download vortex/vortex-functions;
-      echo 'Bucket vortex-functions created successfully';
-      exit 0;
-      "
+      /bin/sh -c " sleep 3; mc alias set vortex http://minio:9000 minioadmin minioadmin; mc mb vortex/vortex-functions --ignore-existing; mc anonymous set download vortex/vortex-functions; echo 'Bucket vortex-functions created successfully'; exit 0; "
+
+  # Redis for real-time log streaming via Pub/Sub
+  redis:
+    image: redis:alpine
+    container_name: vortex-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
   minio_data:

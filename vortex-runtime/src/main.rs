@@ -5,7 +5,11 @@
 //! the Vortex API (Go) for function execution.
 //!
 //! Usage:
-//!   vortex-runtime <path-to-js-file>
+//!   vortex-runtime <path-to-js-file> [--redis-url <url>] [--function-id <id>]
+//!
+//! Options:
+//!   --redis-url <url>    Redis URL for real-time log streaming (e.g., redis://localhost:6379)
+//!   --function-id <id>   Function ID for Redis channel name (logs:<function_id>)
 //!
 //! Output (JSON to stdout):
 //!   {
@@ -48,6 +52,65 @@ impl From<LogEntry> for LogEntryOutput {
     }
 }
 
+/// Parsed CLI arguments
+struct CliArgs {
+    file_path: String,
+    redis_url: Option<String>,
+    function_id: Option<String>,
+}
+
+/// Parse command line arguments
+fn parse_args() -> Result<CliArgs> {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 2 {
+        return Err(anyhow!(
+            "Usage: {} <path-to-js-file> [--redis-url <url>] [--function-id <id>]\n\n\
+             Executes JavaScript from a file and outputs JSON result to stdout.\n\n\
+             Options:\n  \
+               --redis-url <url>    Redis URL for real-time log streaming\n  \
+               --function-id <id>   Function ID for Redis channel name",
+            args.first().map(|s| s.as_str()).unwrap_or("vortex-runtime")
+        ));
+    }
+
+    let file_path = args[1].clone();
+    let mut redis_url: Option<String> = None;
+    let mut function_id: Option<String> = None;
+
+    // Parse optional arguments
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--redis-url" => {
+                if i + 1 < args.len() {
+                    redis_url = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    return Err(anyhow!("--redis-url requires a value"));
+                }
+            }
+            "--function-id" => {
+                if i + 1 < args.len() {
+                    function_id = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    return Err(anyhow!("--function-id requires a value"));
+                }
+            }
+            _ => {
+                return Err(anyhow!("Unknown argument: {}", args[i]));
+            }
+        }
+    }
+
+    Ok(CliArgs {
+        file_path,
+        redis_url,
+        function_id,
+    })
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -58,24 +121,22 @@ async fn main() {
 
 async fn run() -> Result<()> {
     // Parse command line arguments
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() < 2 {
-        return Err(anyhow!(
-            "Usage: {} <path-to-js-file>\n\n\
-             Executes JavaScript from a file and outputs JSON result to stdout.",
-            args.get(0).unwrap_or(&"vortex-runtime".to_string())
-        ));
-    }
-
-    let file_path = &args[1];
+    let cli_args = parse_args()?;
 
     // Read JavaScript code from file
-    let code = fs::read_to_string(file_path)
-        .map_err(|e| anyhow!("Failed to read file '{}': {}", file_path, e))?;
+    let code = fs::read_to_string(&cli_args.file_path)
+        .map_err(|e| anyhow!("Failed to read file '{}': {}", cli_args.file_path, e))?;
 
-    // Create worker and execute
-    let mut worker = VortexWorker::new()
+    // Create Redis client if URL is provided
+    let redis_client = if let Some(ref url) = cli_args.redis_url {
+        Some(redis::Client::open(url.as_str())
+            .map_err(|e| anyhow!("Failed to create Redis client: {}", e))?)
+    } else {
+        None
+    };
+
+    // Create worker with optional Redis support
+    let mut worker = VortexWorker::new_with_redis(redis_client, cli_args.function_id)
         .map_err(|e| anyhow!("Failed to initialize runtime: {}", e))?;
 
     let result = worker
@@ -98,3 +159,4 @@ async fn run() -> Result<()> {
 
     Ok(())
 }
+

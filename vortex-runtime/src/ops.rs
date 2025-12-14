@@ -10,6 +10,15 @@
 //! - Allows synchronous op calls (no async overhead for logging)
 //! - Keeps logs isolated per-execution
 //! - Enables easy collection after script completion
+//!
+//! # Redis Pub/Sub Integration
+//!
+//! For real-time log streaming, we also store an optional `RedisPublisher`
+//! that uses an unbounded mpsc channel to send logs to a background task
+//! that publishes to Redis. This "fire-and-forget" pattern ensures:
+//! - op_log remains synchronous and non-blocking
+//! - V8 event loop is not blocked by Redis I/O
+//! - Logs are still captured locally even if Redis is unavailable
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -17,6 +26,7 @@ use std::rc::Rc;
 use chrono::{DateTime, Utc};
 use deno_core::op2;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 /// A single log entry captured from JavaScript console methods.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,19 +50,46 @@ impl LogEntry {
 /// Type alias for the log storage used in OpState
 pub type LogStorage = Rc<RefCell<Vec<LogEntry>>>;
 
+/// Redis publisher for real-time log streaming.
+/// Uses an unbounded mpsc channel for fire-and-forget publishing.
+pub struct RedisPublisher {
+    /// Sender channel to the background Redis publishing task
+    pub sender: mpsc::UnboundedSender<String>,
+}
+
+/// Type alias for optional Redis publisher state
+pub type RedisPublisherState = Rc<RefCell<Option<RedisPublisher>>>;
+
 /// Custom operation to capture console.log messages.
 ///
 /// This op is called from JavaScript via `Deno.core.ops.op_log(message)`.
 /// Instead of printing to stdout, it stores the message in our log buffer
 /// so it can be returned as part of the ExecutionResult.
 ///
+/// If a Redis publisher is configured, it also publishes the log message
+/// to Redis using a fire-and-forget pattern (non-blocking).
+///
 /// # Arguments
 /// * `state` - The operation state containing our log storage
 /// * `message` - The log message from JavaScript
 #[op2(fast)]
-pub fn op_log(#[state] log_storage: &LogStorage, #[string] message: String) {
+pub fn op_log(
+    #[state] log_storage: &LogStorage,
+    #[state] redis_pub: &RedisPublisherState,
+    #[string] message: String,
+) {
     let entry = LogEntry::new(message);
-    log_storage.borrow_mut().push(entry);
+    
+    // Always store locally for the ExecutionResult
+    log_storage.borrow_mut().push(entry.clone());
+    
+    // Fire-and-forget publish to Redis if configured
+    if let Some(publisher) = redis_pub.borrow().as_ref() {
+        if let Ok(json) = serde_json::to_string(&entry) {
+            // Ignore send errors - Redis publishing is best-effort
+            let _ = publisher.sender.send(json);
+        }
+    }
 }
 
 /// Get the current time in milliseconds since Unix epoch.

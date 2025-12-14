@@ -19,10 +19,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/vortex/vortex-api/internal/api"
 	"github.com/vortex/vortex-api/internal/runner"
 	"github.com/vortex/vortex-api/internal/store"
+	"github.com/vortex/vortex-api/internal/ws"
 )
 
 func main() {
@@ -30,8 +32,12 @@ func main() {
 	log.Println("Starting Vortex API Server...")
 
 	// Configuration (could be loaded from env vars in production)
+	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
+	redisURL := "redis://" + redisAddr
+
 	cfg := Config{
 		ServerAddr: ":8080",
+		RedisAddr:  redisAddr,
 		MinIO: store.BlobStoreConfig{
 			Endpoint:        getEnv("MINIO_ENDPOINT", "localhost:9000"),
 			AccessKeyID:     getEnv("MINIO_ACCESS_KEY", "minioadmin"),
@@ -43,6 +49,7 @@ func main() {
 			BinaryPath:     getRuntimePath(),
 			MaxConcurrent:  10,
 			DefaultTimeout: 5 * time.Second,
+			RedisURL:       redisURL, // Pass Redis URL to runner for Rust binary
 		},
 	}
 
@@ -69,6 +76,21 @@ func main() {
 	// Initialize API handlers
 	handler := api.NewHandler(blobStore, processRunner)
 
+	// Initialize Redis client for WebSocket log streaming
+	log.Printf("Connecting to Redis at %s...", cfg.RedisAddr)
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: cfg.RedisAddr,
+	})
+	// Test Redis connection
+	if _, err := redisClient.Ping(ctx).Result(); err != nil {
+		log.Printf("Warning: Redis connection failed (log streaming disabled): %v", err)
+	} else {
+		log.Println("Connected to Redis successfully")
+	}
+
+	// Initialize WebSocket handler for real-time log streaming
+	wsHandler := ws.NewHandler(redisClient)
+
 	// Set up router with middleware
 	r := chi.NewRouter()
 
@@ -81,6 +103,8 @@ func main() {
 
 	// Register API routes
 	handler.RegisterRoutes(r)
+	// Register WebSocket routes
+	wsHandler.RegisterRoutes(r)
 
 	// Create HTTP server
 	server := &http.Server{
@@ -98,6 +122,7 @@ func main() {
 		log.Println("  POST /deploy          - Deploy a new function")
 		log.Println("  POST /execute/{id}    - Execute a function")
 		log.Println("  GET  /health          - Health check")
+		log.Println("  GET  /ws/{id}         - WebSocket log stream")
 
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)
@@ -123,6 +148,7 @@ func main() {
 // Config holds all configuration for the server.
 type Config struct {
 	ServerAddr string
+	RedisAddr  string // Redis address for pub/sub log streaming
 	MinIO      store.BlobStoreConfig
 	Runner     runner.ProcessRunnerConfig
 }
