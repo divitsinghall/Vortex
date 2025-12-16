@@ -1,0 +1,34 @@
+# Git
+.git
+.gitignore
+
+# Node modules (frontend)
+vortex-web/node_modules
+vortex-web/.next
+
+# Rust build artifacts
+vortex-runtime/target
+
+# Go build artifacts
+vortex-api/vortex-api
+vortex-cli/vortex
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data
+vortex-api/minio_data
+*.log
+
+# Docker
+docker-compose.override.yml
+
+# Artifacts
+/Users/divitsinghal/.gemini

@@ -1,0 +1,188 @@
+# ==============================================================================
+# VORTEX FULL STACK DOCKER COMPOSE
+# ==============================================================================
+#
+# This file orchestrates the complete Vortex FaaS platform:
+#   - backend: Go API + Rust V8 Runtime (unified image)
+#   - frontend: Next.js dashboard
+#   - minio: S3-compatible object storage for function code
+#   - redis: Pub/Sub for real-time log streaming
+#
+# USAGE:
+#   docker-compose up --build         # Build and start all services
+#   docker-compose up -d              # Start in detached mode
+#   docker-compose logs -f backend    # Follow backend logs
+#   docker-compose down               # Stop all services
+#
+# ARCHITECTURE:
+#   ┌──────────────┐     ┌──────────────┐
+#   │   Frontend   │────▶│   Backend    │
+#   │  (Next.js)   │     │  (Go + Rust) │
+#   │  :3000       │     │  :8080       │
+#   └──────────────┘     └──────┬───────┘
+#                               │
+#         ┌─────────────────────┼─────────────────────┐
+#         │                     │                     │
+#         ▼                     ▼                     ▼
+#   ┌──────────┐          ┌──────────┐          ┌──────────┐
+#   │  MinIO   │          │  Redis   │          │ Runtime  │
+#   │  :9000   │          │  :6379   │          │ (os/exec)│
+#   └──────────┘          └──────────┘          └──────────┘
+#
+# ==============================================================================
+
+services:
+  # ============================================================================
+  # BACKEND SERVICE
+  # ============================================================================
+  # Unified image containing both Go API and Rust V8 runtime
+  # The Go API spawns the Rust runtime via os/exec for function execution
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vortex-backend
+    ports:
+      - "8080:8080"
+    environment:
+      # Redis configuration for real-time log streaming
+      REDIS_ADDR: redis:6379
+      # MinIO configuration for function storage
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: vortex-functions
+      # Runtime path (set in Dockerfile, but explicit here for clarity)
+      VORTEX_RUNTIME_PATH: /usr/local/bin/vortex-runtime
+    depends_on:
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      createbucket:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - vortex-network
+
+  # ============================================================================
+  # FRONTEND SERVICE
+  # ============================================================================
+  # Next.js dashboard for deploying and monitoring functions
+
+  frontend:
+    build:
+      context: ./vortex-web
+      dockerfile: Dockerfile
+    container_name: vortex-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      # API URL for server-side requests (container-to-container)
+      NEXT_PUBLIC_API_URL: http://backend:8080
+      # For client-side requests, this would be http://localhost:8080
+      NODE_ENV: production
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - vortex-network
+
+  # ============================================================================
+  # MINIO SERVICE
+  # ============================================================================
+  # S3-compatible object storage for function code
+
+  minio:
+    image: minio/minio:latest
+    container_name: vortex-minio
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Web Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - vortex-network
+
+  # ============================================================================
+  # BUCKET CREATION SERVICE
+  # ============================================================================
+  # One-time init container that creates the vortex-functions bucket
+
+  createbucket:
+    image: minio/mc:latest
+    container_name: vortex-createbucket
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Waiting for MinIO to be ready...';
+        sleep 2;
+        mc alias set vortex http://minio:9000 minioadmin minioadmin;
+        mc mb vortex/vortex-functions --ignore-existing;
+        mc anonymous set download vortex/vortex-functions;
+        echo 'Bucket vortex-functions created successfully!';
+        exit 0;
+      "
+    networks:
+      - vortex-network
+
+  # ============================================================================
+  # REDIS SERVICE
+  # ============================================================================
+  # Pub/Sub for real-time log streaming via WebSocket
+
+  redis:
+    image: redis:alpine
+    container_name: vortex-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - vortex-network
+
+# ==============================================================================
+# VOLUMES
+# ==============================================================================
+
+volumes:
+  minio_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# ==============================================================================
+# NETWORKS
+# ==============================================================================
+
+networks:
+  vortex-network:
+    driver: bridge

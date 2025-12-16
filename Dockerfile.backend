@@ -1,0 +1,146 @@
+# ==============================================================================
+# VORTEX UNIFIED BACKEND DOCKERFILE
+# ==============================================================================
+#
+# This is a MULTI-STAGE build that produces a single container with:
+#   1. The Rust V8 runtime binary (vortex-runtime)
+#   2. The Go API server binary (vortex-api)
+#
+# WHY BOTH BINARIES IN ONE IMAGE?
+# --------------------------------
+# The Go API uses os/exec to spawn the Rust runtime as a subprocess.
+# When a function is executed, the Go server:
+#   1. Retrieves function code from MinIO
+#   2. Writes it to a temp file
+#   3. Calls: exec.Command("/usr/local/bin/vortex-runtime", tempfile)
+#   4. Captures stdout/stderr and parses the JSON output
+#
+# For this to work, BOTH binaries must be on the same filesystem.
+# This Dockerfile packages them together.
+#
+# WHY DEBIAN-SLIM INSTEAD OF ALPINE?
+# -----------------------------------
+# The Rust runtime uses V8 (via deno_core) which is compiled against glibc.
+# Alpine Linux uses musl libc, which causes:
+#   - "Symbol not found" errors
+#   - Segfaults during V8 initialization
+#
+# Debian-slim provides glibc compatibility while staying reasonably small.
+#
+# BUILD COMMAND:
+#   docker build -f Dockerfile.backend -t vortex-backend:latest .
+#
+# ==============================================================================
+
+# ==============================================================================
+# STAGE 1: RUST BUILDER
+# ==============================================================================
+# Build the vortex-runtime binary (V8 JavaScript execution engine)
+
+FROM rust:1.83-bookworm AS rust-builder
+
+# Install build dependencies for V8/deno_core
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    clang \
+    libclang-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user for building (optional security measure)
+WORKDIR /build
+
+# Copy Rust project files
+COPY vortex-runtime/Cargo.toml vortex-runtime/Cargo.lock* ./
+COPY vortex-runtime/build.rs ./
+COPY vortex-runtime/src ./src
+
+# Build release binary
+# The release profile enables optimizations and LTO (from Cargo.toml)
+RUN cargo build --release
+
+# The binary is at: /build/target/release/vortex-runtime
+
+
+# ==============================================================================
+# STAGE 2: GO BUILDER
+# ==============================================================================
+# Build the vortex-api binary (HTTP API server and orchestrator)
+
+FROM golang:1.22-bookworm AS go-builder
+
+WORKDIR /build
+
+# Copy Go module files first (for Docker layer caching)
+COPY vortex-api/go.mod vortex-api/go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy Go source code
+COPY vortex-api/ ./
+
+# Build the server binary
+# CGO_ENABLED=0 would create a static binary, but we keep CGO for compatibility
+# -ldflags="-s -w" strips debug info to reduce binary size
+RUN go build -ldflags="-s -w" -o vortex-api ./cmd/server
+
+# The binary is at: /build/vortex-api
+
+
+# ==============================================================================
+# STAGE 3: FINAL RUNTIME IMAGE
+# ==============================================================================
+# Minimal Debian-based image containing both binaries
+
+FROM debian:bookworm-slim AS runtime
+
+# Add metadata labels
+LABEL org.opencontainers.image.title="Vortex Backend"
+LABEL org.opencontainers.image.description="Vortex FaaS Platform - API Server with V8 Runtime"
+LABEL org.opencontainers.image.source="https://github.com/vortex/vortex"
+
+# Install runtime dependencies
+# - ca-certificates: For HTTPS connections (MinIO, external APIs)
+# - libstdc++6: C++ standard library (required by V8)
+# - libc6: GNU C Library (required by both binaries)
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create a non-root user for running the application
+RUN groupadd -r vortex && useradd -r -g vortex vortex
+
+# Copy binaries from builder stages
+# CRITICAL: Both binaries must be in a PATH-accessible location
+#           so os/exec can find vortex-runtime
+
+COPY --from=rust-builder /build/target/release/vortex-runtime /usr/local/bin/vortex-runtime
+COPY --from=go-builder /build/vortex-api /usr/local/bin/vortex-api
+
+# Ensure binaries are executable
+RUN chmod +x /usr/local/bin/vortex-runtime /usr/local/bin/vortex-api
+
+# Create temp directory for function execution
+RUN mkdir -p /tmp/vortex && chown vortex:vortex /tmp/vortex
+
+# Set environment variables
+# These tell the Go API where to find the Rust runtime
+ENV VORTEX_RUNTIME_PATH=/usr/local/bin/vortex-runtime
+ENV TMPDIR=/tmp/vortex
+
+# Switch to non-root user
+USER vortex
+
+# Expose API port
+EXPOSE 8080
+
+# Health check endpoint
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Start the API server
+CMD ["/usr/local/bin/vortex-api"]
