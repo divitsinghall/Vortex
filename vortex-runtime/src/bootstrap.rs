@@ -58,24 +58,22 @@ globalThis.vortex = {
 let __timerId = 0;
 const __activeTimers = new Map();
 
-// setTimeout polyfill that works with our async runtime
-// We use a promise-based approach that polls the current time
+// setTimeout polyfill using op_sleep for proper async sleeping
+// This properly yields to the tokio runtime instead of busy-waiting
 globalThis.setTimeout = (callback, delay = 0) => {
   const id = ++__timerId;
-  const startTime = ops.op_get_time_ms();
   
   const timerPromise = (async () => {
-    while (true) {
-      const elapsed = ops.op_get_time_ms() - startTime;
-      if (elapsed >= delay) {
-        __activeTimers.delete(id);
-        if (typeof callback === 'function') {
-          callback();
-        }
-        return;
+    // Use op_sleep for proper async waiting (backed by tokio::time::sleep)
+    // BigInt is required because op_sleep expects a bigint parameter
+    await ops.op_sleep(BigInt(Math.max(0, delay)));
+    
+    // Only call callback if timer wasn't cleared
+    if (__activeTimers.has(id)) {
+      __activeTimers.delete(id);
+      if (typeof callback === 'function') {
+        callback();
       }
-      // Yield to the event loop
-      await Promise.resolve();
     }
   })();
   

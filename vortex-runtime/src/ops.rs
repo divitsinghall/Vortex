@@ -1,15 +1,12 @@
 //! Custom deno_core operations for the Vortex runtime.
 //!
-//! Operations (Ops) are the bridge between JavaScript and Rust. They allow
-//! JavaScript code running in the V8 isolate to call into Rust functions.
+//! # Snapshot Compatibility
 //!
-//! # Architecture Decision: OpState for Log Storage
+//! These ops are designed to work in TWO contexts:
+//! 1. **Snapshot generation** (build.rs) - State is NOT present
+//! 2. **Runtime execution** (worker.rs) - State IS present
 //!
-//! We use `OpState` to store a `Rc<RefCell<Vec<LogEntry>>>` that accumulates
-//! log messages during script execution. This approach:
-//! - Allows synchronous op calls (no async overhead for logging)
-//! - Keeps logs isolated per-execution
-//! - Enables easy collection after script completion
+//! The ops use `OpState::try_borrow()` patterns to gracefully handle missing state.
 //!
 //! # Redis Pub/Sub Integration
 //!
@@ -24,7 +21,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
-use deno_core::op2;
+use deno_core::{op2, OpState};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -66,35 +63,41 @@ pub type RedisPublisherState = Rc<RefCell<Option<RedisPublisher>>>;
 /// Instead of printing to stdout, it stores the message in our log buffer
 /// so it can be returned as part of the ExecutionResult.
 ///
-/// If a Redis publisher is configured, it also publishes the log message
-/// to Redis using a fire-and-forget pattern (non-blocking).
+/// # Snapshot Resilience
+///
+/// This op is called during BOTH snapshot generation and runtime execution.
+/// During snapshot generation, OpState won't have LogStorage or RedisPublisher.
+/// We use `OpState::try_borrow()` to gracefully handle this case.
 ///
 /// # Arguments
-/// * `state` - The operation state containing our log storage
+/// * `state` - The operation state (may or may not contain our storage)
 /// * `message` - The log message from JavaScript
 #[op2(fast)]
-pub fn op_log(
-    #[state] log_storage: &LogStorage,
-    #[state] redis_pub: &RedisPublisherState,
-    #[string] message: String,
-) {
-    let entry = LogEntry::new(message);
-    
-    // Always store locally for the ExecutionResult
-    log_storage.borrow_mut().push(entry.clone());
-    
-    // Fire-and-forget publish to Redis if configured
-    if let Some(publisher) = redis_pub.borrow().as_ref() {
-        if let Ok(json) = serde_json::to_string(&entry) {
-            // Ignore send errors - Redis publishing is best-effort
-            let _ = publisher.sender.send(json);
+pub fn op_log(state: &OpState, #[string] message: String) {
+    // Try to get LogStorage - may not exist during snapshot generation
+    if let Some(log_storage) = state.try_borrow::<LogStorage>() {
+        let entry = LogEntry::new(message.clone());
+        
+        // Store locally for the ExecutionResult
+        log_storage.borrow_mut().push(entry.clone());
+        
+        // Try to get RedisPublisher - may not exist
+        if let Some(redis_pub) = state.try_borrow::<RedisPublisherState>() {
+            // Fire-and-forget publish to Redis if configured
+            if let Some(publisher) = redis_pub.borrow().as_ref() {
+                if let Ok(json) = serde_json::to_string(&entry) {
+                    // Ignore send errors - Redis publishing is best-effort
+                    let _ = publisher.sender.send(json);
+                }
+            }
         }
     }
+    // If no state, silently ignore (we're in snapshot generation)
 }
 
 /// Get the current time in milliseconds since Unix epoch.
 ///
-/// This op supports our setTimeout polyfill by providing accurate timing.
+/// This op supports timing operations in JavaScript.
 /// It's marked as `fast` since it's a simple, synchronous operation.
 #[op2(fast)]
 pub fn op_get_time_ms() -> f64 {
@@ -102,6 +105,19 @@ pub fn op_get_time_ms() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as f64)
         .unwrap_or(0.0)
+}
+
+/// Async sleep operation backed by tokio.
+///
+/// This replaces the busy-wait setTimeout loop with proper async sleeping.
+/// The tokio runtime will properly yield the thread during the sleep,
+/// allowing thousands of concurrent tenants without burning CPU cycles.
+///
+/// # Arguments
+/// * `delay_ms` - The number of milliseconds to sleep
+#[op2(async)]
+pub async fn op_sleep(#[bigint] delay_ms: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 }
 
 #[cfg(test)]
@@ -134,5 +150,14 @@ mod tests {
         assert!(time2 > time1);
         assert!(time2 - time1 >= 10.0);
     }
-}
 
+    #[tokio::test]
+    async fn test_op_sleep_logic() {
+        // Test the underlying sleep logic
+        let start = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let elapsed = start.elapsed().as_millis();
+        assert!(elapsed >= 50);
+        assert!(elapsed < 100); // Should be reasonably close
+    }
+}

@@ -19,7 +19,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::bootstrap::BOOTSTRAP_JS;
-use crate::ops::{op_get_time_ms, op_log, LogEntry, LogStorage, RedisPublisher, RedisPublisherState};
+use crate::ops::{op_get_time_ms, op_log, op_sleep, LogEntry, LogStorage, RedisPublisher, RedisPublisherState};
 
 /// Result of executing a JavaScript script in the Vortex runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ impl ExecutionResult {
 // Now includes both LogStorage and RedisPublisherState
 extension!(
     vortex_runtime,
-    ops = [op_log, op_get_time_ms],
+    ops = [op_log, op_get_time_ms, op_sleep],
     options = {
         log_storage: LogStorage,
         redis_pub: RedisPublisherState,
